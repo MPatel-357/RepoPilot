@@ -8,21 +8,19 @@ from app.services.repository_scanner import scan_repository
 
 def build_dependency_graph(repository_path: str) -> dict:
     """
-    Build a directed graph of local Python module imports.
+    Build a graph of local Python imports.
 
-    An edge A -> B means that file A imports file B.
+    An edge A -> B means file A imports file B.
+    Supports absolute and relative static imports.
     """
     scan = scan_repository(repository_path)
     graph = nx.DiGraph()
-
-    # Map Python module names to their file paths.
     module_map = {}
 
+    # Step 1: Map module names to repository files.
     for file in scan["files"]:
         file_path = file["file"]
-        module = Path(file_path).with_suffix("")
-
-        parts = list(module.parts)
+        parts = list(Path(file_path).with_suffix("").parts)
 
         if parts[-1] == "__init__":
             parts.pop()
@@ -34,38 +32,80 @@ def build_dependency_graph(repository_path: str) -> dict:
 
         graph.add_node(file_path)
 
-    # Connect files through their imports.
+    def find_module(module_name):
+        """Find the closest existing local module."""
+        parts = module_name.split(".")
+
+        for length in range(len(parts), 0, -1):
+            candidate = ".".join(parts[:length])
+
+            if candidate in module_map:
+                return module_map[candidate]
+
+        return None
+
+    # Step 2: Resolve local import relationships.
     for file in scan["files"]:
         source = file["file"]
+        source_parts = list(Path(source).with_suffix("").parts)
+
+        # __init__.py belongs to the package itself.
+        if source_parts[-1] == "__init__":
+            package_parts = source_parts[:-1]
+        else:
+            package_parts = source_parts[:-1]
 
         for imported in file["imports"]:
-            if imported["module"].startswith("."):
-                # Relative imports will be handled later.
-                continue
+            module = imported["module"]
+            names = imported.get("names", [])
 
-            imported_module = imported["module"]
+            if module.startswith("."):
+                level = len(module) - len(module.lstrip("."))
+                remainder = module[level:]
 
-            # Try the full module, then its parent modules.
-            parts = imported_module.split(".")
+                if level > len(package_parts):
+                    continue
 
-            for length in range(len(parts), 0, -1):
-                candidate = ".".join(parts[:length])
+                base_parts = package_parts[:len(package_parts) - level + 1]
 
-                if candidate in module_map:
-                    target = module_map[candidate]
+                if remainder:
+                    base_parts.extend(remainder.split("."))
 
-                    if source != target:
-                        graph.add_edge(source, target)
+                base_module = ".".join(base_parts)
 
-                    break
+            else:
+                base_module = module
+
+            # A "from package import module" statement may
+            # refer to a submodule rather than a symbol.
+            candidates = []
+
+            for name in names:
+                if name != "*":
+                    candidates.append(
+                        f"{base_module}.{name}" if base_module else name
+                    )
+
+            if base_module:
+                candidates.append(base_module)
+
+            targets = set()
+
+            for candidate in candidates:
+                target = find_module(candidate)
+
+                if target and target != source:
+                    targets.add(target)
+
+            for target in targets:
+                graph.add_edge(source, target)
 
     return {
         "total_nodes": graph.number_of_nodes(),
         "total_edges": graph.number_of_edges(),
-        "nodes": list(graph.nodes),
+        "nodes": sorted(graph.nodes),
         "edges": [
             {"source": source, "target": target}
-            for source, target in graph.edges
+            for source, target in sorted(graph.edges)
         ],
     }
-
